@@ -30,6 +30,8 @@ Implemented:
 Known limitations:
 
 - cancellation and persistent settings are not implemented;
+- official portable builds do not bundle `libdvdcss`; encrypted DVD media may
+  require a compatible external component where its use is lawful;
 - Blu-ray ISO/folder remuxing has not received the same real-media coverage as
   DVD ISO remuxing;
 - optical media vary significantly, so a successful build is not proof that a
@@ -81,6 +83,19 @@ cmake --build build-windows -j"$(nproc)"
 
 The resulting `.exe` still needs the corresponding shared MXE DLLs beside it.
 Those redistributable packages are intentionally not tracked in Git.
+
+## Windows binary releases
+
+Windows releases are portable ZIP archives. Extract the entire directory and
+run `MakeMkvCraft.exe`; do not move the executable away from its DLLs and the
+`platforms` directory.
+
+Official archives do not include `libdvdcss`. The bundled `libdvdread` build
+loads it only when a user supplies a compatible copy independently and local
+law permits its use.
+
+See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the libraries and
+licenses present in binary distributions.
 
 ## Repository boundaries
 
