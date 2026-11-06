@@ -20,7 +20,7 @@ static void ffmpegLog(void*, int level, const char* format, va_list args) {
 
 int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
-    app.setApplicationName("MakeMKV Free");
+    app.setApplicationName("MakeMkvCraft");
     app.setApplicationVersion("0.1.0");
 
     // Initialize logger — writes to log.txt next to the exe

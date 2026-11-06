@@ -54,7 +54,7 @@ MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
     setupUi();
-    setWindowTitle("MakeMKV Free");
+    setWindowTitle("MakeMkvCraft");
     resize(900, 500);
     setMinimumSize(700, 360);
 }
@@ -506,8 +506,8 @@ void MainWindow::onSettings() {
 }
 
 void MainWindow::onAbout() {
-    QMessageBox::about(this, "Sobre MakeMKV Free",
-        "<h3>MakeMKV Free</h3>"
+    QMessageBox::about(this, "Sobre MakeMkvCraft",
+        "<h3>MakeMkvCraft</h3>"
         "<p>Aplicativo livre e independente para remux de DVD/Blu-ray → MKV.</p>"
         "<p>Baseado em Qt 5, libbluray, libdvdread, libdvdnav e FFmpeg.</p>"
         "<p>Versão 0.1.0 — GPL-3.0-or-later.</p>"

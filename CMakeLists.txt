@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(MakeMKVFree VERSION 0.1.0 LANGUAGES CXX)
+project(MakeMkvCraft VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,7 +23,7 @@ pkg_check_modules(AVUTIL REQUIRED libavutil)
 pkg_check_modules(SWRESAMPLE REQUIRED libswresample)
 pkg_check_modules(SWSCALE REQUIRED libswscale)
 
-add_executable(makemkv-free WIN32
+add_executable(MakeMkvCraft WIN32
     src/main.cpp
     src/MainWindow.cpp
     src/MainWindow.h
@@ -33,7 +33,7 @@ add_executable(makemkv-free WIN32
     src/MkvRemuxer.h
 )
 
-target_include_directories(makemkv-free PRIVATE
+target_include_directories(MakeMkvCraft PRIVATE
     ${BLURAY_INCLUDE_DIRS}
     ${DVDREAD_INCLUDE_DIRS}
     ${DVDNAV_INCLUDE_DIRS}
@@ -44,7 +44,7 @@ target_include_directories(makemkv-free PRIVATE
     ${SWSCALE_INCLUDE_DIRS}
 )
 
-target_link_libraries(makemkv-free PRIVATE
+target_link_libraries(MakeMkvCraft PRIVATE
     Qt5::Widgets
     ${BLURAY_LIBRARIES}
     ${DVDREAD_LIBRARIES}

@@ -1,4 +1,4 @@
-# MakeMKV Free
+# MakeMkvCraft
 
 An independent, open-source desktop application for inspecting DVD/Blu-ray
 media and remuxing selected titles to Matroska without re-encoding.
@@ -63,7 +63,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
 ```
 
-The executable is generated as `build/makemkv-free`.
+The executable is generated as `build/MakeMkvCraft`.
 
 ## Cross-compile for Windows x64 with MXE
 
