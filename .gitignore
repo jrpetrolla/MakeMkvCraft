@@ -1,0 +1,49 @@
+# Build trees and packaged binaries
+build*/
+_build*/
+dist/
+mxe/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Private reference and media fixtures
+private/
+reference/
+analysis/
+test-data/
+ISO/
+_extracted/
+_backups/
+Setup_MakeMKV*
+*.iso
+*.img
+*.vob
+*.ifo
+*.bup
+*.m2ts
+*.mpls
+
+# Local backups, logs, caches, and secrets
+*.bak
+*.pre-*
+*.log
+*.tmp
+.cache/
+.env
+*.env
+*.secret
+*secret*
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
