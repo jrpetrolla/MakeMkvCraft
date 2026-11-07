@@ -28,15 +28,10 @@ private slots:
     void onOpenFolder();
     void onOpenImage();
     void onOpenDrive();
-    void onEjectDisc();
     void onRefreshTree();
-    void onSelectAll();
-    void onSelectNone();
+    void onTreeItemChanged(QTreeWidgetItem* item, int column);
     void onSaveMkv();
-    void onCancelJob();
     void onClearLog();
-    void onSettings();
-    void onAbout();
 
 private:
     void setupUi();
@@ -48,13 +43,7 @@ private:
     QPushButton* m_btnOpenFolder;
     QPushButton* m_btnOpenImage;
     QPushButton* m_btnOpenDrive;
-    QPushButton* m_btnEject;
     QPushButton* m_btnSaveMkv;
-    QPushButton* m_btnCancel;
-    QPushButton* m_btnSelectAll;
-    QPushButton* m_btnSelectNone;
-    QPushButton* m_btnSettings;
-    QPushButton* m_btnAbout;
 
     QTreeWidget* m_tree;
 

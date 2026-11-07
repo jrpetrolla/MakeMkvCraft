@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="/icons">
+    <file alias="app.png">MakeMkvCraft.png</file>
+  </qresource>
+</RCC>

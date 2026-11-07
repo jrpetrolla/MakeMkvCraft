@@ -31,7 +31,21 @@ add_executable(MakeMkvCraft WIN32
     src/DiscInspector.h
     src/MkvRemuxer.cpp
     src/MkvRemuxer.h
+    assets/MakeMkvCraft.qrc
 )
+
+if(WIN32)
+    enable_language(RC)
+    set(MAKEMKVCRAFT_ICON_ICO
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/MakeMkvCraft.ico")
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/MakeMkvCraft.rc.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/MakeMkvCraft.rc"
+        @ONLY
+    )
+    target_sources(MakeMkvCraft PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}/MakeMkvCraft.rc")
+endif()
 
 target_include_directories(MakeMkvCraft PRIVATE
     ${BLURAY_INCLUDE_DIRS}

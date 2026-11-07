@@ -15,6 +15,7 @@
 #include <QApplication>
 #include <QCloseEvent>
 #include <QMetaObject>
+#include <QSignalBlocker>
 #include <QThread>
 #include <algorithm>
 #include <memory>
@@ -40,14 +41,6 @@ enum TreeItemKind {
     ChapterDetailItem = 4
 };
 
-void setCheckStateRecursively(QTreeWidgetItem* item, Qt::CheckState state) {
-    if (item->flags() & Qt::ItemIsUserCheckable) {
-        item->setCheckState(0, state);
-    }
-    for (int i = 0; i < item->childCount(); ++i) {
-        setCheckStateRecursively(item->child(i), state);
-    }
-}
 }
 
 MainWindow::MainWindow(QWidget* parent)
@@ -86,17 +79,10 @@ void MainWindow::setupUi() {
     m_btnOpenFolder = new QPushButton("Abrir pasta");
     m_btnOpenImage = new QPushButton("Abrir ISO");
     m_btnOpenDrive = new QPushButton("Abrir disco");
-    m_btnEject = new QPushButton("Ejetar");
     m_btnSaveMkv = new QPushButton("Salvar MKV");
-    m_btnCancel = new QPushButton("Cancelar");
-    m_btnSelectAll = new QPushButton("Selecionar tudo");
-    m_btnSelectNone = new QPushButton("Desmarcar");
-    m_btnSettings = new QPushButton("Configurações");
-    m_btnAbout = new QPushButton("Sobre");
 
-    for (auto* btn : {m_btnOpenFolder, m_btnOpenImage, m_btnOpenDrive, m_btnEject,
-                      m_btnSaveMkv, m_btnCancel,
-                      m_btnSelectAll, m_btnSelectNone, m_btnSettings, m_btnAbout}) {
+    for (auto* btn : {m_btnOpenFolder, m_btnOpenImage, m_btnOpenDrive,
+                      m_btnSaveMkv}) {
         btn->setMinimumHeight(28);
         btnBar->addWidget(btn);
     }
@@ -118,13 +104,15 @@ void MainWindow::setupUi() {
 
     // --- Tree only (no log panel) ---
     m_tree = new QTreeWidget;
-    m_tree->setColumnCount(5);
-    m_tree->setHeaderLabels({"Sel", "Título", "Duração", "Capítulos", "Faixas"});
+    m_tree->setColumnCount(6);
+    m_tree->setHeaderLabels(
+        {"Sel", "Título", "Encoding", "Duração", "Capítulos", "Faixas"});
     m_tree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     m_tree->header()->setSectionResizeMode(1, QHeaderView::Stretch);
     m_tree->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
     m_tree->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
     m_tree->header()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+    m_tree->header()->setSectionResizeMode(5, QHeaderView::ResizeToContents);
     outerLayout->addWidget(m_tree, 1);
 
     // --- Progress bar ---
@@ -140,78 +128,94 @@ void MainWindow::setupUi() {
     connect(m_btnOpenFolder, &QPushButton::clicked, this, &MainWindow::onOpenFolder);
     connect(m_btnOpenImage, &QPushButton::clicked, this, &MainWindow::onOpenImage);
     connect(m_btnOpenDrive, &QPushButton::clicked, this, &MainWindow::onOpenDrive);
-    connect(m_btnEject, &QPushButton::clicked, this, &MainWindow::onEjectDisc);
     connect(m_btnSaveMkv, &QPushButton::clicked, this, &MainWindow::onSaveMkv);
-    connect(m_btnCancel, &QPushButton::clicked, this, &MainWindow::onCancelJob);
-    connect(m_btnSelectAll, &QPushButton::clicked, this, &MainWindow::onSelectAll);
-    connect(m_btnSelectNone, &QPushButton::clicked, this, &MainWindow::onSelectNone);
-    connect(m_btnSettings, &QPushButton::clicked, this, &MainWindow::onSettings);
-    connect(m_btnAbout, &QPushButton::clicked, this, &MainWindow::onAbout);
+    connect(m_tree, &QTreeWidget::itemChanged,
+            this, &MainWindow::onTreeItemChanged);
 
-    m_btnCancel->setEnabled(false);
     setControlsEnabled(false);
 }
 
 void MainWindow::populateTree(const DiscInfo& disc) {
+    const QSignalBlocker blocker(m_tree);
     m_tree->clear();
+
+    size_t longestTitlePosition = disc.titles.size();
+    if (!disc.titles.empty()) {
+        const auto longestTitle = std::max_element(
+            disc.titles.begin(), disc.titles.end(),
+            [](const TitleInfo& left, const TitleInfo& right) {
+                return left.duration_ms < right.duration_ms;
+            });
+        longestTitlePosition = static_cast<size_t>(
+            std::distance(disc.titles.begin(), longestTitle));
+    }
 
     for (size_t titlePosition = 0; titlePosition < disc.titles.size(); ++titlePosition) {
         const auto& title = disc.titles[titlePosition];
+        const bool selectedByDefault = titlePosition == longestTitlePosition;
         auto* item = new QTreeWidgetItem;
         item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
-        item->setCheckState(0, title.selected ? Qt::Checked : Qt::Unchecked);
+        item->setCheckState(0, selectedByDefault ? Qt::Checked : Qt::Unchecked);
         item->setData(0, kItemKindRole, TitleItem);
         item->setData(0, kItemPositionRole, static_cast<int>(titlePosition));
         item->setText(1, QString::fromStdString(title.name));
-        item->setText(2, formatDuration(title.duration_ms));
-        item->setText(3, QString::number(title.chapter_count));
-        item->setText(4, QString::number(title.tracks.size()));
+        const auto videoTrack = std::find_if(
+            title.tracks.begin(), title.tracks.end(),
+            [](const TrackInfo& track) { return track.type == "video"; });
+        if (videoTrack != title.tracks.end()) {
+            item->setText(2, QString::fromStdString(videoTrack->codec));
+        }
+        item->setText(3, formatDuration(title.duration_ms));
+        item->setText(4, QString::number(title.chapter_count));
+        item->setText(5, QString::number(title.tracks.size()));
 
         LOG("populateTree: title=" + std::to_string(title.index) +
             ", tracks=" + std::to_string(title.tracks.size()) +
-            ", chapters=" + std::to_string(title.chapters.size()));
+            ", chapters=" + std::to_string(title.chapters.size()) +
+            ", selected=" + (selectedByDefault ? "yes" : "no"));
 
         for (size_t trackPosition = 0; trackPosition < title.tracks.size(); ++trackPosition) {
             const auto& track = title.tracks[trackPosition];
             auto* child = new QTreeWidgetItem;
             child->setFlags(child->flags() | Qt::ItemIsUserCheckable);
-            child->setCheckState(0, track.selected ? Qt::Checked : Qt::Unchecked);
+            child->setCheckState(0,
+                selectedByDefault ? Qt::Checked : Qt::Unchecked);
             child->setData(0, kItemKindRole, TrackItem);
             child->setData(0, kItemPositionRole, static_cast<int>(trackPosition));
-            child->setText(1, QString("%1 #%2 — %3")
+            child->setText(1, QString("%1 #%2")
                 .arg(QString::fromStdString(track.type))
-                .arg(track.index)
-                .arg(QString::fromStdString(track.codec)));
+                .arg(track.index));
+            child->setText(2, QString::fromStdString(track.codec));
             if (track.type == "video")
-                child->setText(2, QString("%1x%2").arg(track.width).arg(track.height));
+                child->setText(3, QString("%1x%2").arg(track.width).arg(track.height));
             else if (track.type == "audio") {
                 QString details = QString("%1ch").arg(track.channels);
                 if (!track.language.empty()) {
                     details += " · " + QString::fromStdString(track.language);
                 }
-                child->setText(2, details);
+                child->setText(3, details);
             }
             else
-                child->setText(2, QString::fromStdString(track.language));
+                child->setText(3, QString::fromStdString(track.language));
             item->addChild(child);
 
             LOG("populateTree: track position=" + std::to_string(trackPosition) +
                 ", type=" + track.type + ", codec=" + track.codec +
                 ", id=" + std::to_string(track.stream_id) +
                 ", language=" + (track.language.empty() ? "und" : track.language) +
-                ", selected=" + (track.selected ? "yes" : "no"));
+                ", selected=" + (selectedByDefault ? "yes" : "no"));
         }
 
         if (!title.chapters.empty()) {
             auto* chaptersItem = new QTreeWidgetItem;
             chaptersItem->setFlags(chaptersItem->flags() | Qt::ItemIsUserCheckable);
             chaptersItem->setCheckState(0,
-                title.include_chapters ? Qt::Checked : Qt::Unchecked);
+                selectedByDefault ? Qt::Checked : Qt::Unchecked);
             chaptersItem->setData(0, kItemKindRole, ChaptersItem);
             chaptersItem->setText(1,
                 QString("Capítulos (%1)").arg(title.chapters.size()));
-            chaptersItem->setText(2, formatDuration(title.duration_ms));
-            chaptersItem->setText(3, QString::number(title.chapters.size()));
+            chaptersItem->setText(3, formatDuration(title.duration_ms));
+            chaptersItem->setText(4, QString::number(title.chapters.size()));
 
             for (const auto& chapter : title.chapters) {
                 auto* chapterItem = new QTreeWidgetItem;
@@ -219,8 +223,8 @@ void MainWindow::populateTree(const DiscInfo& disc) {
                     chapterItem->flags() & ~Qt::ItemIsUserCheckable);
                 chapterItem->setData(0, kItemKindRole, ChapterDetailItem);
                 chapterItem->setText(1, QString::fromStdString(chapter.name));
-                chapterItem->setText(2, formatDuration(chapter.start_ms));
-                chapterItem->setText(3,
+                chapterItem->setText(3, formatDuration(chapter.start_ms));
+                chapterItem->setText(4,
                     formatDuration(chapter.end_ms - chapter.start_ms));
                 chaptersItem->addChild(chapterItem);
             }
@@ -229,7 +233,7 @@ void MainWindow::populateTree(const DiscInfo& disc) {
 
         m_tree->addTopLevelItem(item);
     }
-    m_tree->expandAll();
+    m_tree->collapseAll();
 }
 
 void MainWindow::logMessage(const QString& msg) {
@@ -238,18 +242,13 @@ void MainWindow::logMessage(const QString& msg) {
 
 void MainWindow::setControlsEnabled(bool enabled) {
     m_btnSaveMkv->setEnabled(enabled);
-    m_btnSelectAll->setEnabled(enabled);
-    m_btnSelectNone->setEnabled(enabled);
-    m_btnEject->setEnabled(enabled);
 }
 
 void MainWindow::setRemuxBusy(bool busy) {
     m_btnOpenFolder->setEnabled(!busy);
     m_btnOpenImage->setEnabled(!busy);
     m_btnOpenDrive->setEnabled(!busy);
-    m_btnSettings->setEnabled(!busy);
     m_tree->setEnabled(!busy);
-    m_btnCancel->setEnabled(false);
     setControlsEnabled(!busy && m_currentDisc.valid);
 }
 
@@ -328,24 +327,24 @@ void MainWindow::onOpenDrive() {
     setControlsEnabled(true);
 }
 
-void MainWindow::onEjectDisc() {
-    logMessage("Ejetar disco — não implementado neste sistema.");
-}
-
 void MainWindow::onRefreshTree() {
     if (m_currentDisc.valid)
         populateTree(m_currentDisc);
 }
 
-void MainWindow::onSelectAll() {
-    for (int i = 0; i < m_tree->topLevelItemCount(); i++) {
-        setCheckStateRecursively(m_tree->topLevelItem(i), Qt::Checked);
+void MainWindow::onTreeItemChanged(QTreeWidgetItem* item, int column) {
+    if (!item || column != 0 ||
+        item->data(0, kItemKindRole).toInt() != TitleItem) {
+        return;
     }
-}
 
-void MainWindow::onSelectNone() {
-    for (int i = 0; i < m_tree->topLevelItemCount(); i++) {
-        setCheckStateRecursively(m_tree->topLevelItem(i), Qt::Unchecked);
+    const QSignalBlocker blocker(m_tree);
+    const Qt::CheckState state = item->checkState(0);
+    for (int i = 0; i < item->childCount(); ++i) {
+        QTreeWidgetItem* child = item->child(i);
+        if (child->flags() & Qt::ItemIsUserCheckable) {
+            child->setCheckState(0, state);
+        }
     }
 }
 
@@ -402,7 +401,6 @@ void MainWindow::onSaveMkv() {
     if (outDir.isEmpty()) return;
 
     logMessage(QString("Iniciando remux de %1 título(s) para %2").arg(selCount).arg(outDir));
-    m_lblStatus->setText("Preparando remux...");
     m_progress->setRange(0, 1000);
     m_progress->setValue(0);
     m_progress->setFormat("%p% — Preparando");
@@ -427,7 +425,6 @@ void MainWindow::onSaveMkv() {
                             if (!m_remuxThread) return;
                             m_progress->setValue(std::clamp(value, 0, 1000));
                             m_progress->setFormat("%p% — " + statusText);
-                            m_lblStatus->setText(statusText);
                         },
                         Qt::QueuedConnection);
                 };
@@ -458,7 +455,6 @@ void MainWindow::onSaveMkv() {
             if (success == selCount) {
                 m_progress->setValue(1000);
                 m_progress->setFormat("%p% — Concluído");
-                m_lblStatus->setText(QString("Concluído: %1 arquivo(s) criados.").arg(success));
                 logMessage(QString("Remux concluído: %1/%2 título(s) salvos.")
                     .arg(success).arg(selCount));
                 QString message = QString("%1 arquivo(s) MKV criados em:\n%2")
@@ -471,8 +467,6 @@ void MainWindow::onSaveMkv() {
                 }
             } else if (success > 0) {
                 m_progress->setFormat("%p% — Falha após conclusão parcial");
-                m_lblStatus->setText(QString("Parcial: %1 de %2 concluídos.")
-                    .arg(success).arg(selCount));
                 logMessage(QString("Remux parcial: %1/%2. Erro: %3")
                     .arg(success).arg(selCount).arg(errorText));
                 QMessageBox::warning(this, "Salvar MKV",
@@ -480,7 +474,6 @@ void MainWindow::onSaveMkv() {
                         .arg(success).arg(selCount).arg(errorText));
             } else {
                 m_progress->setFormat("%p% — Falha");
-                m_lblStatus->setText("Falha no remux.");
                 logMessage("Erro no remux: " + errorText);
                 QMessageBox::critical(this, "Salvar MKV",
                     errorText + "\n\nVeja log.txt para detalhes.");
@@ -490,26 +483,6 @@ void MainWindow::onSaveMkv() {
     worker->start();
 }
 
-void MainWindow::onCancelJob() {
-    logMessage("Cancelar — não implementado nesta versão.");
-}
-
 void MainWindow::onClearLog() {
     // No-op — log now goes to log.txt
-}
-
-void MainWindow::onSettings() {
-    QMessageBox::information(this, "Configurações",
-        "Diálogo de configurações — será implementado.\n\n"
-        "Incluíra: pasta de saída padrão, preferência de idioma,\n"
-        "seleção automática de faixas, e configurações de mux.");
-}
-
-void MainWindow::onAbout() {
-    QMessageBox::about(this, "Sobre MakeMkvCraft",
-        "<h3>MakeMkvCraft</h3>"
-        "<p>Aplicativo livre e independente para remux de DVD/Blu-ray → MKV.</p>"
-        "<p>Baseado em Qt 5, libbluray, libdvdread, libdvdnav e FFmpeg.</p>"
-        "<p>Versão 0.1.0 — GPL-3.0-or-later.</p>"
-        "<p><small>Projeto não afiliado nem endossado pelo MakeMKV ou pela GuinpinSoft.</small></p>");
 }

@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 #include "MkvRemuxer.h"
 #include <QApplication>
+#include <QIcon>
 #include <QStandardPaths>
 #include <cstdarg>
 #include <cstdio>
@@ -22,6 +23,7 @@ int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     app.setApplicationName("MakeMkvCraft");
     app.setApplicationVersion("0.1.0");
+    app.setWindowIcon(QIcon(":/icons/app.png"));
 
     // Initialize logger — writes to log.txt next to the exe
     QString exePath = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);

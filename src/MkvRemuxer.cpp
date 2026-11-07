@@ -39,11 +39,46 @@ static constexpr int64_t adaptiveDtsCorrection(int64_t previousDts,
     return observedDts < minimumDts ? minimumDts - observedDts : 0;
 }
 
+static constexpr bool canFinalizeTerminalAdaptiveBoundaryAtEof(
+    size_t observedContinuousAnchors,
+    size_t invalidPositionedStreams,
+    size_t invalidPositionlessStreams) {
+    return observedContinuousAnchors > 0 &&
+        invalidPositionedStreams == 0 &&
+        invalidPositionlessStreams == 0;
+}
+
+static constexpr bool isEarlierClockSegment(size_t packetSegment,
+                                            size_t boundarySegment) {
+    return packetSegment < boundarySegment;
+}
+
+static constexpr bool shouldExposeTerminalScrCandidate(
+    bool candidatePending, int64_t candidateByteOffset, int64_t totalBytes,
+    int64_t previousSegmentByteOffset) {
+    return candidatePending && candidateByteOffset > previousSegmentByteOffset &&
+        candidateByteOffset < totalBytes;
+}
+
 static_assert(adaptiveDtsCorrection(31043, 31041, true) == 2);
 static_assert(adaptiveDtsCorrection(27971, 27943, true) == 28);
+static_assert(adaptiveDtsCorrection(5954529, 297, true) == 5954232);
 static_assert(adaptiveDtsCorrection(1000, 1000, true) == 0);
 static_assert(adaptiveDtsCorrection(1000, 1000, false) == 1);
 static_assert(adaptiveDtsCorrection(1000, 1002, true) == 0);
+static_assert(canFinalizeTerminalAdaptiveBoundaryAtEof(1, 0, 0));
+static_assert(!canFinalizeTerminalAdaptiveBoundaryAtEof(0, 0, 0));
+static_assert(!canFinalizeTerminalAdaptiveBoundaryAtEof(1, 1, 0));
+static_assert(!canFinalizeTerminalAdaptiveBoundaryAtEof(1, 0, 1));
+static_assert(isEarlierClockSegment(8, 9));
+static_assert(!isEarlierClockSegment(9, 9));
+static_assert(!isEarlierClockSegment(10, 9));
+static_assert(shouldExposeTerminalScrCandidate(
+    true, 3827357696, 3827363840, 0));
+static_assert(!shouldExposeTerminalScrCandidate(
+    true, 3827363840, 3827363840, 0));
+static_assert(!shouldExposeTerminalScrCandidate(
+    false, 3827357696, 3827363840, 0));
 
 // --- Logger ---
 
@@ -440,6 +475,7 @@ bool MkvRemuxer::remuxDvdIso(const DiscInfo& disc, const TitleInfo& title,
     int pending_scr_vobu = 0;
     int scr_candidate_replacements = 0;
     int scr_candidate_rejections = 0;
+    int scr_terminal_provisional_segments = 0;
 
     auto selectedTitleIsActive = [&]() {
         int32_t activeTitle = 0;
@@ -812,6 +848,37 @@ bool MkvRemuxer::remuxDvdIso(const DiscInfo& disc, const TitleInfo& title,
         }
     }
 
+    if (extraction_ok && !dvdClockTimeline.empty() &&
+        shouldExposeTerminalScrCandidate(
+            pending_scr_discontinuity, pending_scr_byte_offset, total_bytes,
+            dvdClockTimeline.back().byte_offset)) {
+        // EOF can arrive before the eight-SCR confirmation window. Expose the
+        // byte boundary without trusting the incomplete SCR sample: retain the
+        // previous base offset and let positioned media DTS anchors decide the
+        // one global adaptive correction during muxing.
+        dvdClockTimeline.push_back({
+            pending_scr_byte_offset,
+            current_scr_offset_90k,
+            pending_raw_scr_90k,
+            pending_raw_scr_90k + current_scr_offset_90k,
+            pending_scr_cell,
+            pending_scr_vobu
+        });
+        scr_terminal_provisional_segments++;
+        LOG("remuxDvdIso: exposing terminal unconfirmed SCR candidate as "
+            "provisional adaptive boundary, byte=" +
+            std::to_string(pending_scr_byte_offset) + ", VOBU=" +
+            std::to_string(pending_scr_vobu) + ", cell=" +
+            std::to_string(pending_scr_cell) + ", candidate_delta_90k=" +
+            std::to_string(pending_scr_delta_90k) +
+            ", confirmation_samples=" +
+            std::to_string(pending_scr_confirmation_samples) +
+            ", payload_bytes=" +
+            std::to_string(total_bytes - pending_scr_byte_offset) +
+            ", inherited_offset_90k=" +
+            std::to_string(current_scr_offset_90k));
+    }
+
     if (fclose(tempFile) != 0) {
         LOG("remuxDvdIso: fclose temp failed");
         extraction_ok = false;
@@ -831,6 +898,8 @@ bool MkvRemuxer::remuxDvdIso(const DiscInfo& disc, const TitleInfo& title,
         std::to_string(scr_candidate_replacements) +
         ", SCR candidate rejections=" +
         std::to_string(scr_candidate_rejections) +
+        ", SCR terminal provisional segments=" +
+        std::to_string(scr_terminal_provisional_segments) +
         ", dvdnav recoveries=" + std::to_string(nav_read_recoveries));
 
     if (!extraction_ok || !selected_title_seen || total_bytes <= 0 || dvdTimeline.empty() ||
@@ -1188,6 +1257,7 @@ bool MkvRemuxer::remuxWithLibav(const std::string& inputPath, const std::string&
     int64_t adaptive_large_deviation_count = 0;
     int64_t timeline_adjusted_count = 0;
     int64_t inherited_position_count = 0;
+    int64_t terminal_boundary_inherited_count = 0;
     int64_t global_fallback_position_count = 0;
     int64_t max_muxed_time_ms = 0;
     int64_t max_input_position = 0;
@@ -1200,6 +1270,8 @@ bool MkvRemuxer::remuxWithLibav(const std::string& inputPath, const std::string&
     int lastMuxPermille = 0;
     constexpr size_t kNoTimelineSegment = static_cast<size_t>(-1);
     std::vector<size_t> lastPositionedTimelineSegmentByInput(
+        inputToOutput.size(), kNoTimelineSegment);
+    std::vector<size_t> terminalBoundarySegmentByInput(
         inputToOutput.size(), kNoTimelineSegment);
     size_t furthestPositionedTimelineSegment = kNoTimelineSegment;
     std::vector<int64_t> adaptiveSegmentCorrection90k(
@@ -1299,11 +1371,15 @@ bool MkvRemuxer::remuxWithLibav(const std::string& inputPath, const std::string&
         return int64_t{0};
     };
 
+    auto effectiveClockOffsetForSegment = [&](size_t segmentIndex) {
+        return dvdClockTimeline[segmentIndex].timestamp_offset_90k +
+            adaptiveCorrectionForSegment(segmentIndex);
+    };
+
     auto clockOffsetForPosition = [&](int64_t position, int64_t& offset90k) {
         size_t segmentIndex = 0;
         if (!clockSegmentIndexForPosition(position, segmentIndex)) return false;
-        offset90k = dvdClockTimeline[segmentIndex].timestamp_offset_90k +
-            adaptiveCorrectionForSegment(segmentIndex);
+        offset90k = effectiveClockOffsetForSegment(segmentIndex);
         return true;
     };
 
@@ -1625,6 +1701,113 @@ bool MkvRemuxer::remuxWithLibav(const std::string& inputPath, const std::string&
         return true;
     };
 
+    auto validateEarlierSegmentAdaptiveBoundaryStream = [&](size_t segmentIndex,
+                                                             int inputIndex) {
+        if (segmentIndex >= dvdClockTimeline.size() || inputIndex < 0 ||
+            static_cast<size_t>(inputIndex) >= inputToOutput.size()) {
+            return false;
+        }
+
+        size_t positionedPackets = 0;
+        size_t bufferedPackets = 0;
+        for (const AVPacket* queued : adaptiveBoundaryPackets) {
+            if (!queued || queued->stream_index != inputIndex) continue;
+            bufferedPackets++;
+            if (queued->pos < 0) continue;
+
+            size_t packetSegment = kNoTimelineSegment;
+            if (!clockSegmentIndexForPosition(queued->pos, packetSegment) ||
+                !isEarlierClockSegment(packetSegment, segmentIndex)) {
+                LOG("remuxWithLibav: terminal positioned stream is not confined to an "
+                    "earlier SCR segment, boundary_segment=" +
+                    std::to_string(segmentIndex) + ", input_stream=" +
+                    std::to_string(inputIndex) + ", packet_segment=" +
+                    (packetSegment == kNoTimelineSegment
+                        ? std::string("unresolved")
+                        : std::to_string(packetSegment)) +
+                    ", pos=" + std::to_string(queued->pos));
+                return false;
+            }
+            positionedPackets++;
+        }
+
+        if (positionedPackets == 0) return false;
+        LOG("remuxWithLibav: terminal earlier-segment stream validated, "
+            "boundary_segment=" + std::to_string(segmentIndex) +
+            ", input_stream=" + std::to_string(inputIndex) +
+            ", positioned_packets=" + std::to_string(positionedPackets) +
+            ", buffered_packets=" + std::to_string(bufferedPackets));
+        return true;
+    };
+
+    auto validatePositionlessAdaptiveBoundaryStream = [&](size_t segmentIndex,
+                                                           int inputIndex) {
+        if (segmentIndex >= dvdClockTimeline.size() || inputIndex < 0 ||
+            static_cast<size_t>(inputIndex) >= inputToOutput.size()) {
+            return false;
+        }
+        const int outputIndex = inputToOutput[inputIndex];
+        if (outputIndex < 0 || outputIndex >= static_cast<int>(timestampStates.size())) {
+            return false;
+        }
+
+        AVStream* inputStream = inCtx->streams[inputIndex];
+        AVStream* outputStream = outCtx->streams[outputIndex];
+        const int64_t candidateCorrection90k =
+            adaptiveCorrectionForSegment(segmentIndex) +
+            adaptiveBoundaryMaxResidual90k;
+        const int64_t effectiveOffset90k =
+            dvdClockTimeline[segmentIndex].timestamp_offset_90k +
+            candidateCorrection90k;
+        const int64_t offsetInInputTimebase = av_rescale_q_rnd(
+            effectiveOffset90k, AVRational{1, 90000}, inputStream->time_base,
+            static_cast<AVRounding>(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+        int64_t previousDts = timestampStates[outputIndex].last_dts;
+        size_t validatedPackets = 0;
+
+        for (const AVPacket* queued : adaptiveBoundaryPackets) {
+            if (!queued || queued->stream_index != inputIndex) continue;
+            if (queued->pos >= 0) return false;
+
+            const int64_t rawDts = queued->dts != AV_NOPTS_VALUE
+                ? queued->dts : queued->pts;
+            if (rawDts == AV_NOPTS_VALUE) {
+                LOG("remuxWithLibav: terminal positionless packet lacks DTS, segment=" +
+                    std::to_string(segmentIndex) + ", input_stream=" +
+                    std::to_string(inputIndex));
+                return false;
+            }
+            const int64_t candidateDts = av_rescale_q_rnd(
+                rawDts + offsetInInputTimebase, inputStream->time_base,
+                outputStream->time_base,
+                static_cast<AVRounding>(
+                    AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+            if (previousDts != AV_NOPTS_VALUE &&
+                adaptiveDtsCorrection(previousDts, candidateDts, allowEqualDts) != 0) {
+                LOG("remuxWithLibav: terminal positionless stream would regress, segment=" +
+                    std::to_string(segmentIndex) + ", input_stream=" +
+                    std::to_string(inputIndex) + ", output_stream=" +
+                    std::to_string(outputIndex) + ", previous_dts=" +
+                    std::to_string(previousDts) + ", candidate_dts=" +
+                    std::to_string(candidateDts) + ", effective_offset_90k=" +
+                    std::to_string(effectiveOffset90k));
+                return false;
+            }
+            previousDts = candidateDts;
+            validatedPackets++;
+        }
+
+        if (validatedPackets == 0) return false;
+        LOG("remuxWithLibav: terminal positionless stream validated, segment=" +
+            std::to_string(segmentIndex) + ", input_stream=" +
+            std::to_string(inputIndex) + ", output_stream=" +
+            std::to_string(outputIndex) + ", packets=" +
+            std::to_string(validatedPackets) + ", final_candidate_dts=" +
+            std::to_string(previousDts) + ", effective_offset_90k=" +
+            std::to_string(effectiveOffset90k));
+        return true;
+    };
+
     auto replayAdaptiveBoundaryPackets = [&]() {
         while (!adaptiveBoundaryPackets.empty()) {
             replayPackets.push_back(adaptiveBoundaryPackets.front());
@@ -1697,10 +1880,116 @@ bool MkvRemuxer::remuxWithLibav(const std::string& inputPath, const std::string&
                 ", ret=" + std::to_string(ret));
         }
         if (ret < 0) {
+            if (ret != AVERROR_EOF) {
+                char errbuf[256];
+                av_strerror(ret, errbuf, sizeof(errbuf));
+                errorMsg = std::string("Erro ao ler entrada: ") + errbuf;
+                LOG("remuxWithLibav: av_read_frame failed: " + std::string(errbuf));
+                ok = false;
+                break;
+            }
             if (!adaptiveBoundaryPackets.empty()) {
+                std::vector<int> inactiveInputStreams;
+                std::vector<int> earlierSegmentInputStreams;
+                std::vector<int> invalidPositionedInputStreams;
+                std::vector<int> positionlessInputStreams;
+                std::vector<int> invalidPositionlessInputStreams;
+                std::vector<size_t> bufferedPacketsByInput(
+                    adaptiveBoundaryAnchorRequired.size(), 0);
+                std::vector<bool> positionedPacketsByInput(
+                    adaptiveBoundaryAnchorRequired.size(), false);
+                for (const AVPacket* queued : adaptiveBoundaryPackets) {
+                    if (queued && queued->stream_index >= 0 &&
+                        static_cast<size_t>(queued->stream_index) <
+                            bufferedPacketsByInput.size()) {
+                        bufferedPacketsByInput[queued->stream_index]++;
+                        if (queued->pos >= 0) {
+                            positionedPacketsByInput[queued->stream_index] = true;
+                        }
+                    }
+                }
+                for (size_t inputIndex = 0;
+                     inputIndex < adaptiveBoundaryAnchorRequired.size();
+                     ++inputIndex) {
+                    if (!adaptiveBoundaryAnchorRequired[inputIndex] ||
+                        adaptiveBoundaryAnchorSeen[inputIndex]) {
+                        continue;
+                    }
+                    if (bufferedPacketsByInput[inputIndex] == 0) {
+                        inactiveInputStreams.push_back(
+                            static_cast<int>(inputIndex));
+                    } else if (positionedPacketsByInput[inputIndex]) {
+                        const int streamIndex = static_cast<int>(inputIndex);
+                        if (validateEarlierSegmentAdaptiveBoundaryStream(
+                                adaptiveBoundarySegment, streamIndex)) {
+                            earlierSegmentInputStreams.push_back(streamIndex);
+                        } else {
+                            invalidPositionedInputStreams.push_back(streamIndex);
+                        }
+                    } else {
+                        positionlessInputStreams.push_back(
+                            static_cast<int>(inputIndex));
+                    }
+                }
+
+                for (const int inputIndex : positionlessInputStreams) {
+                    if (!validatePositionlessAdaptiveBoundaryStream(
+                            adaptiveBoundarySegment, inputIndex)) {
+                        invalidPositionlessInputStreams.push_back(inputIndex);
+                    }
+                }
+
+                if (canFinalizeTerminalAdaptiveBoundaryAtEof(
+                        adaptiveBoundarySeenAnchorCount,
+                        invalidPositionedInputStreams.size(),
+                        invalidPositionlessInputStreams.size())) {
+                    for (const int inputIndex : inactiveInputStreams) {
+                        adaptiveBoundaryAnchorRequired[inputIndex] = false;
+                    }
+                    for (const int inputIndex : earlierSegmentInputStreams) {
+                        adaptiveBoundaryAnchorRequired[inputIndex] = false;
+                    }
+                    for (const int inputIndex : positionlessInputStreams) {
+                        adaptiveBoundaryAnchorRequired[inputIndex] = false;
+                        terminalBoundarySegmentByInput[inputIndex] =
+                            adaptiveBoundarySegment;
+                    }
+                    adaptiveBoundaryRequiredAnchorCount =
+                        adaptiveBoundarySeenAnchorCount;
+                    LOG("remuxWithLibav: final adaptive SCR segment accepted with " +
+                        std::to_string(positionlessInputStreams.size()) +
+                        " validated positionless stream(s) and " +
+                        std::to_string(earlierSegmentInputStreams.size()) +
+                        " earlier-segment stream(s) and " +
+                        std::to_string(inactiveInputStreams.size()) +
+                        " inactive stream(s); finalizing from " +
+                        std::to_string(adaptiveBoundarySeenAnchorCount) +
+                        " observed anchor(s), segment=" +
+                        std::to_string(adaptiveBoundarySegment) +
+                        ", buffered_packets=" +
+                        std::to_string(adaptiveBoundaryPackets.size()) +
+                        ", buffered_bytes=" +
+                        std::to_string(adaptive_boundary_buffer_bytes));
+                    finalizeAdaptiveSegment(adaptiveBoundarySegment);
+                    replayAdaptiveBoundaryPackets();
+                    continue;
+                }
+
                 errorMsg = "Fim da entrada antes das âncoras contínuas do segmento SCR.";
                 LOG("remuxWithLibav: input ended with unresolved adaptive SCR boundary, "
                     "segment=" + std::to_string(adaptiveBoundarySegment) +
+                    ", observed_anchors=" +
+                    std::to_string(adaptiveBoundarySeenAnchorCount) +
+                    ", earlier_segment_streams=" +
+                    std::to_string(earlierSegmentInputStreams.size()) +
+                    ", invalid_positioned_streams=" +
+                    std::to_string(invalidPositionedInputStreams.size()) +
+                    ", positionless_streams=" +
+                    std::to_string(positionlessInputStreams.size()) +
+                    ", invalid_positionless_streams=" +
+                    std::to_string(invalidPositionlessInputStreams.size()) +
+                    ", inactive_streams=" +
+                    std::to_string(inactiveInputStreams.size()) +
                     ", buffered_packets=" +
                     std::to_string(adaptiveBoundaryPackets.size()) +
                     ", buffered_bytes=" +
@@ -1708,16 +1997,8 @@ bool MkvRemuxer::remuxWithLibav(const std::string& inputPath, const std::string&
                 ok = false;
                 break;
             }
-            if (ret != AVERROR_EOF) {
-                char errbuf[256];
-                av_strerror(ret, errbuf, sizeof(errbuf));
-                errorMsg = std::string("Erro ao ler entrada: ") + errbuf;
-                LOG("remuxWithLibav: av_read_frame failed: " + std::string(errbuf));
-                ok = false;
-            } else {
-                reportMuxProgress(true);
-                LOG("remuxWithLibav: end of input");
-            }
+            reportMuxProgress(true);
+            LOG("remuxWithLibav: end of input");
             break;
         }
 
@@ -1800,11 +2081,11 @@ bool MkvRemuxer::remuxWithLibav(const std::string& inputPath, const std::string&
 
                 if (furthestPositionedTimelineSegment != kNoTimelineSegment &&
                     dvdClockSegmentIndex > furthestPositionedTimelineSegment &&
-                    dvdClockTimeline[dvdClockSegmentIndex].timestamp_offset_90k !=
-                        dvdClockTimeline[furthestPositionedTimelineSegment]
-                            .timestamp_offset_90k) {
+                    effectiveClockOffsetForSegment(dvdClockSegmentIndex) !=
+                        effectiveClockOffsetForSegment(
+                            furthestPositionedTimelineSegment)) {
                     if (!flushInterleaver(
-                            "SCR offset change at byte " +
+                            "effective SCR offset change at byte " +
                                 std::to_string(
                                     dvdClockTimeline[dvdClockSegmentIndex].byte_offset),
                             true)) {
@@ -1819,6 +2100,11 @@ bool MkvRemuxer::remuxWithLibav(const std::string& inputPath, const std::string&
                     dvdClockSegmentIndex > furthestPositionedTimelineSegment) {
                     furthestPositionedTimelineSegment = dvdClockSegmentIndex;
                 }
+            } else if (terminalBoundarySegmentByInput[input_idx] != kNoTimelineSegment) {
+                dvdClockSegmentIndex = terminalBoundarySegmentByInput[input_idx];
+                dvdClockSegmentSource = "validated-terminal-boundary-inheritance";
+                inherited_position_count++;
+                terminal_boundary_inherited_count++;
             } else if (lastPositionedTimelineSegmentByInput[input_idx] != kNoTimelineSegment) {
                 dvdClockSegmentIndex = lastPositionedTimelineSegmentByInput[input_idx];
                 dvdClockSegmentSource = "per-stream-inheritance";
@@ -1856,10 +2142,8 @@ bool MkvRemuxer::remuxWithLibav(const std::string& inputPath, const std::string&
             dvdClockSegment = &dvdClockTimeline[dvdClockSegmentIndex];
             clockSegmentUsed[dvdClockSegmentIndex] = true;
 
-            const int64_t adaptiveCorrection90k =
-                adaptiveCorrectionForSegment(dvdClockSegmentIndex);
             int64_t offsetInInputTimebase = av_rescale_q_rnd(
-                dvdClockSegment->timestamp_offset_90k + adaptiveCorrection90k,
+                effectiveClockOffsetForSegment(dvdClockSegmentIndex),
                 AVRational{1, 90000},
                 inStream->time_base,
                 static_cast<AVRounding>(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
@@ -2011,6 +2295,8 @@ bool MkvRemuxer::remuxWithLibav(const std::string& inputPath, const std::string&
         std::to_string(dvdClockTimeline.size()) +
         " clock segments, inherited segment for " +
         std::to_string(inherited_position_count) + " packets without byte position (" +
+        std::to_string(terminal_boundary_inherited_count) +
+        " validated terminal-boundary inheritances, " +
         std::to_string(global_fallback_position_count) +
         " global fallbacks before per-stream anchor), bounded PTS generated " +
         std::to_string(bounded_genpts_count) + ", bounded PTS fallbacks " +
