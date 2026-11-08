@@ -22,7 +22,7 @@ static void ffmpegLog(void*, int level, const char* format, va_list args) {
 int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     app.setApplicationName("MakeMkvCraft");
-    app.setApplicationVersion("0.1.0");
+    app.setApplicationVersion(MAKEMKVCRAFT_VERSION);
     app.setWindowIcon(QIcon(":/icons/app.png"));
 
     // Initialize logger — writes to log.txt next to the exe

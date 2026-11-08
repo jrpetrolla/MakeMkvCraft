@@ -17,8 +17,19 @@
 #include <QMetaObject>
 #include <QSignalBlocker>
 #include <QThread>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <algorithm>
+#include <cwchar>
 #include <memory>
+#include <set>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 static QString formatDuration(int64_t ms) {
     int totalSec = static_cast<int>(ms / 1000);
@@ -33,6 +44,8 @@ static QString formatDuration(int64_t ms) {
 namespace {
 constexpr int kItemKindRole = Qt::UserRole;
 constexpr int kItemPositionRole = Qt::UserRole + 1;
+constexpr int kTrackTypeRole = Qt::UserRole + 2;
+constexpr int kForcedFromSourceRole = Qt::UserRole + 3;
 
 enum TreeItemKind {
     TitleItem = 1,
@@ -40,6 +53,127 @@ enum TreeItemKind {
     ChaptersItem = 3,
     ChapterDetailItem = 4
 };
+
+enum TreeColumn {
+    SelectionColumn = 0,
+    NameColumn = 1,
+    EncodingColumn = 2,
+    DetailsColumn = 3,
+    ChaptersColumn = 4,
+    TracksColumn = 5,
+    DefaultColumn = 6,
+    ForcedColumn = 7
+};
+
+#ifdef _WIN32
+constexpr int kDriveReadyRole = Qt::UserRole + 10;
+
+struct OpticalDriveInfo {
+    QString root;
+    QString volumeLabel;
+    QString state;
+    bool ready = false;
+};
+
+static std::vector<OpticalDriveInfo> enumerateOpticalDrives() {
+    std::vector<OpticalDriveInfo> drives;
+    const DWORD required = GetLogicalDriveStringsW(0, nullptr);
+    if (required == 0) return drives;
+
+    std::vector<wchar_t> roots(required + 1, L'\0');
+    if (GetLogicalDriveStringsW(required, roots.data()) == 0) return drives;
+
+    for (const wchar_t* root = roots.data(); *root != L'\0';
+         root += std::wcslen(root) + 1) {
+        if (GetDriveTypeW(root) != DRIVE_CDROM) continue;
+
+        OpticalDriveInfo drive;
+        drive.root = QString::fromWCharArray(root);
+
+        wchar_t volumeName[MAX_PATH + 1] = {};
+        if (GetVolumeInformationW(root, volumeName, MAX_PATH + 1, nullptr,
+                                  nullptr, nullptr, nullptr, 0)) {
+            drive.ready = true;
+            drive.volumeLabel = QString::fromWCharArray(volumeName);
+            drive.state = "pronta";
+        } else {
+            const DWORD error = GetLastError();
+            if (error == ERROR_NOT_READY || error == ERROR_NO_MEDIA_IN_DRIVE) {
+                drive.state = "sem mídia";
+            } else if (error == ERROR_ACCESS_DENIED) {
+                drive.state = "acesso negado";
+            } else if (error == ERROR_UNRECOGNIZED_VOLUME) {
+                drive.state = "mídia ilegível";
+            } else {
+                drive.state = QString("erro %1").arg(error);
+            }
+        }
+        drives.push_back(std::move(drive));
+    }
+    return drives;
+}
+
+static QString selectOpticalDrive(QWidget* parent) {
+    QDialog dialog(parent);
+    dialog.setWindowTitle("Selecionar unidade óptica");
+    dialog.setMinimumWidth(460);
+
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->addWidget(new QLabel(
+        "Selecione uma unidade com mídia pronta para leitura.", &dialog));
+
+    auto* driveRow = new QHBoxLayout;
+    auto* combo = new QComboBox(&dialog);
+    auto* refreshButton = new QPushButton("Atualizar", &dialog);
+    driveRow->addWidget(combo, 1);
+    driveRow->addWidget(refreshButton);
+    layout->addLayout(driveRow);
+
+    auto* buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    layout->addWidget(buttons);
+
+    auto updateOkState = [combo, buttons]() {
+        buttons->button(QDialogButtonBox::Ok)->setEnabled(
+            combo->currentData(kDriveReadyRole).toBool());
+    };
+    auto reload = [combo, updateOkState]() {
+        combo->clear();
+        const auto drives = enumerateOpticalDrives();
+        if (drives.empty()) {
+            combo->addItem("Nenhuma unidade óptica encontrada");
+            combo->setItemData(0, false, kDriveReadyRole);
+            updateOkState();
+            return;
+        }
+
+        for (const auto& drive : drives) {
+            const QString label = drive.volumeLabel.isEmpty()
+                ? "sem rótulo" : drive.volumeLabel;
+            combo->addItem(
+                QString("%1 — %2 — %3")
+                    .arg(drive.root.left(2), label, drive.state),
+                drive.root);
+            const int index = combo->count() - 1;
+            combo->setItemData(index, drive.ready, kDriveReadyRole);
+        }
+        updateOkState();
+    };
+
+    QObject::connect(refreshButton, &QPushButton::clicked,
+                     &dialog, [reload]() { reload(); });
+    QObject::connect(combo, qOverload<int>(&QComboBox::currentIndexChanged),
+                     &dialog, [updateOkState](int) { updateOkState(); });
+    QObject::connect(buttons, &QDialogButtonBox::accepted,
+                     &dialog, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected,
+                     &dialog, &QDialog::reject);
+
+    reload();
+    if (dialog.exec() != QDialog::Accepted) return {};
+    return combo->currentData().toString();
+}
+#endif
 
 }
 
@@ -104,15 +238,15 @@ void MainWindow::setupUi() {
 
     // --- Tree only (no log panel) ---
     m_tree = new QTreeWidget;
-    m_tree->setColumnCount(6);
+    m_tree->setColumnCount(8);
     m_tree->setHeaderLabels(
-        {"Sel", "Título", "Encoding", "Duração", "Capítulos", "Faixas"});
-    m_tree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-    m_tree->header()->setSectionResizeMode(1, QHeaderView::Stretch);
-    m_tree->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    m_tree->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
-    m_tree->header()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
-    m_tree->header()->setSectionResizeMode(5, QHeaderView::ResizeToContents);
+        {"Sel", "Título", "Encoding", "Duração", "Capítulos", "Faixas",
+         "Default", "Forced"});
+    m_tree->header()->setSectionResizeMode(SelectionColumn, QHeaderView::ResizeToContents);
+    m_tree->header()->setSectionResizeMode(NameColumn, QHeaderView::Stretch);
+    for (int column = EncodingColumn; column <= ForcedColumn; ++column) {
+        m_tree->header()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
+    }
     outerLayout->addWidget(m_tree, 1);
 
     // --- Progress bar ---
@@ -139,35 +273,26 @@ void MainWindow::populateTree(const DiscInfo& disc) {
     const QSignalBlocker blocker(m_tree);
     m_tree->clear();
 
-    size_t longestTitlePosition = disc.titles.size();
-    if (!disc.titles.empty()) {
-        const auto longestTitle = std::max_element(
-            disc.titles.begin(), disc.titles.end(),
-            [](const TitleInfo& left, const TitleInfo& right) {
-                return left.duration_ms < right.duration_ms;
-            });
-        longestTitlePosition = static_cast<size_t>(
-            std::distance(disc.titles.begin(), longestTitle));
-    }
-
     for (size_t titlePosition = 0; titlePosition < disc.titles.size(); ++titlePosition) {
         const auto& title = disc.titles[titlePosition];
-        const bool selectedByDefault = titlePosition == longestTitlePosition;
+        const bool selectedByDefault = title.output.selected;
         auto* item = new QTreeWidgetItem;
         item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
-        item->setCheckState(0, selectedByDefault ? Qt::Checked : Qt::Unchecked);
-        item->setData(0, kItemKindRole, TitleItem);
-        item->setData(0, kItemPositionRole, static_cast<int>(titlePosition));
-        item->setText(1, QString::fromStdString(title.name));
+        item->setCheckState(SelectionColumn,
+            selectedByDefault ? Qt::Checked : Qt::Unchecked);
+        item->setData(SelectionColumn, kItemKindRole, TitleItem);
+        item->setData(SelectionColumn, kItemPositionRole,
+            static_cast<int>(titlePosition));
+        item->setText(NameColumn, QString::fromStdString(title.name));
         const auto videoTrack = std::find_if(
             title.tracks.begin(), title.tracks.end(),
             [](const TrackInfo& track) { return track.type == "video"; });
         if (videoTrack != title.tracks.end()) {
-            item->setText(2, QString::fromStdString(videoTrack->codec));
+            item->setText(EncodingColumn, QString::fromStdString(videoTrack->codec));
         }
-        item->setText(3, formatDuration(title.duration_ms));
-        item->setText(4, QString::number(title.chapter_count));
-        item->setText(5, QString::number(title.tracks.size()));
+        item->setText(DetailsColumn, formatDuration(title.duration_ms));
+        item->setText(ChaptersColumn, QString::number(title.chapter_count));
+        item->setText(TracksColumn, QString::number(title.tracks.size()));
 
         LOG("populateTree: title=" + std::to_string(title.index) +
             ", tracks=" + std::to_string(title.tracks.size()) +
@@ -178,53 +303,78 @@ void MainWindow::populateTree(const DiscInfo& disc) {
             const auto& track = title.tracks[trackPosition];
             auto* child = new QTreeWidgetItem;
             child->setFlags(child->flags() | Qt::ItemIsUserCheckable);
-            child->setCheckState(0,
-                selectedByDefault ? Qt::Checked : Qt::Unchecked);
-            child->setData(0, kItemKindRole, TrackItem);
-            child->setData(0, kItemPositionRole, static_cast<int>(trackPosition));
-            child->setText(1, QString("%1 #%2")
+            child->setCheckState(SelectionColumn,
+                track.output.selected ? Qt::Checked : Qt::Unchecked);
+            child->setData(SelectionColumn, kItemKindRole, TrackItem);
+            child->setData(SelectionColumn, kItemPositionRole,
+                static_cast<int>(trackPosition));
+            child->setData(SelectionColumn, kTrackTypeRole,
+                QString::fromStdString(track.type));
+            child->setData(SelectionColumn, kForcedFromSourceRole,
+                track.forced_from_source);
+            child->setText(NameColumn, QString("%1 #%2")
                 .arg(QString::fromStdString(track.type))
                 .arg(track.index));
-            child->setText(2, QString::fromStdString(track.codec));
+            child->setText(EncodingColumn, QString::fromStdString(track.codec));
             if (track.type == "video")
-                child->setText(3, QString("%1x%2").arg(track.width).arg(track.height));
+                child->setText(DetailsColumn,
+                    QString("%1x%2").arg(track.width).arg(track.height));
             else if (track.type == "audio") {
                 QString details = QString("%1ch").arg(track.channels);
                 if (!track.language.empty()) {
                     details += " · " + QString::fromStdString(track.language);
                 }
-                child->setText(3, details);
+                child->setText(DetailsColumn, details);
             }
             else
-                child->setText(3, QString::fromStdString(track.language));
+                child->setText(DetailsColumn, QString::fromStdString(track.language));
+
+            child->setCheckState(DefaultColumn,
+                track.output.mkv_default ? Qt::Checked : Qt::Unchecked);
+            child->setToolTip(DefaultColumn,
+                "Define a flag DefaultTrack do Matroska; apenas uma por tipo.");
+            if (track.type == "subtitle") {
+                child->setCheckState(ForcedColumn,
+                    track.output.mkv_forced ? Qt::Checked : Qt::Unchecked);
+                child->setToolTip(ForcedColumn,
+                    "Define a flag ForcedTrack da faixa inteira no Matroska.");
+            } else {
+                child->setText(ForcedColumn, "—");
+            }
             item->addChild(child);
 
             LOG("populateTree: track position=" + std::to_string(trackPosition) +
                 ", type=" + track.type + ", codec=" + track.codec +
                 ", id=" + std::to_string(track.stream_id) +
                 ", language=" + (track.language.empty() ? "und" : track.language) +
-                ", selected=" + (selectedByDefault ? "yes" : "no"));
+                ", selected=" + (track.output.selected ? "yes" : "no") +
+                ", default=" + (track.output.mkv_default ? "yes" : "no") +
+                ", forced=" + (track.output.mkv_forced ? "yes" : "no"));
         }
 
         if (!title.chapters.empty()) {
             auto* chaptersItem = new QTreeWidgetItem;
             chaptersItem->setFlags(chaptersItem->flags() | Qt::ItemIsUserCheckable);
-            chaptersItem->setCheckState(0,
-                selectedByDefault ? Qt::Checked : Qt::Unchecked);
-            chaptersItem->setData(0, kItemKindRole, ChaptersItem);
-            chaptersItem->setText(1,
+            chaptersItem->setCheckState(SelectionColumn,
+                title.output.include_chapters ? Qt::Checked : Qt::Unchecked);
+            chaptersItem->setData(SelectionColumn, kItemKindRole, ChaptersItem);
+            chaptersItem->setText(NameColumn,
                 QString("Capítulos (%1)").arg(title.chapters.size()));
-            chaptersItem->setText(3, formatDuration(title.duration_ms));
-            chaptersItem->setText(4, QString::number(title.chapters.size()));
+            chaptersItem->setText(DetailsColumn, formatDuration(title.duration_ms));
+            chaptersItem->setText(ChaptersColumn,
+                QString::number(title.chapters.size()));
 
             for (const auto& chapter : title.chapters) {
                 auto* chapterItem = new QTreeWidgetItem;
                 chapterItem->setFlags(
                     chapterItem->flags() & ~Qt::ItemIsUserCheckable);
-                chapterItem->setData(0, kItemKindRole, ChapterDetailItem);
-                chapterItem->setText(1, QString::fromStdString(chapter.name));
-                chapterItem->setText(3, formatDuration(chapter.start_ms));
-                chapterItem->setText(4,
+                chapterItem->setData(SelectionColumn, kItemKindRole,
+                    ChapterDetailItem);
+                chapterItem->setText(NameColumn,
+                    QString::fromStdString(chapter.name));
+                chapterItem->setText(DetailsColumn,
+                    formatDuration(chapter.start_ms));
+                chapterItem->setText(ChaptersColumn,
                     formatDuration(chapter.end_ms - chapter.start_ms));
                 chaptersItem->addChild(chapterItem);
             }
@@ -266,10 +416,12 @@ void MainWindow::onOpenFolder() {
     }
 
     m_lblSource->setText("Origem: " + QString::fromStdString(m_currentDisc.source_path));
-    m_lblType->setText("Tipo: " + QString::fromStdString(m_currentDisc.disc_type));
+    const std::string discType = discTypeLabel(
+        m_currentDisc.disc_kind, m_currentDisc.source_kind);
+    m_lblType->setText("Tipo: " + QString::fromStdString(discType));
     m_lblStatus->setText(QString("%1 título(s) encontrado(s).").arg(m_currentDisc.titles.size()));
     logMessage(QString("Detectado: %1, %2 título(s)")
-        .arg(QString::fromStdString(m_currentDisc.disc_type))
+        .arg(QString::fromStdString(discType))
         .arg(m_currentDisc.titles.size()));
 
     populateTree(m_currentDisc);
@@ -292,10 +444,12 @@ void MainWindow::onOpenImage() {
     }
 
     m_lblSource->setText("Origem: " + QString::fromStdString(m_currentDisc.source_path));
-    m_lblType->setText("Tipo: " + QString::fromStdString(m_currentDisc.disc_type));
+    const std::string discType = discTypeLabel(
+        m_currentDisc.disc_kind, m_currentDisc.source_kind);
+    m_lblType->setText("Tipo: " + QString::fromStdString(discType));
     m_lblStatus->setText(QString("%1 título(s) encontrado(s).").arg(m_currentDisc.titles.size()));
     logMessage(QString("Detectado: %1, %2 título(s)")
-        .arg(QString::fromStdString(m_currentDisc.disc_type))
+        .arg(QString::fromStdString(discType))
         .arg(m_currentDisc.titles.size()));
 
     populateTree(m_currentDisc);
@@ -303,12 +457,16 @@ void MainWindow::onOpenImage() {
 }
 
 void MainWindow::onOpenDrive() {
+#ifdef _WIN32
+    QString drive = selectOpticalDrive(this);
+#else
     QString drive = QFileDialog::getExistingDirectory(this, "Selecionar unidade de disco",
         "/dev");
+#endif
     if (drive.isEmpty()) return;
 
     logMessage("Abrindo disco: " + drive);
-    m_currentDisc = m_inspector.inspectDirectory(drive.toStdString());
+    m_currentDisc = m_inspector.inspectOpticalDrive(drive.toStdString());
 
     if (!m_currentDisc.valid) {
         QMessageBox::warning(this, "Erro", QString::fromStdString(m_currentDisc.error));
@@ -317,10 +475,12 @@ void MainWindow::onOpenDrive() {
     }
 
     m_lblSource->setText("Origem: " + QString::fromStdString(m_currentDisc.source_path));
-    m_lblType->setText("Tipo: " + QString::fromStdString(m_currentDisc.disc_type));
+    const std::string discType = discTypeLabel(
+        m_currentDisc.disc_kind, m_currentDisc.source_kind);
+    m_lblType->setText("Tipo: " + QString::fromStdString(discType));
     m_lblStatus->setText(QString("%1 título(s) encontrado(s).").arg(m_currentDisc.titles.size()));
     logMessage(QString("Detectado: %1, %2 título(s)")
-        .arg(QString::fromStdString(m_currentDisc.disc_type))
+        .arg(QString::fromStdString(discType))
         .arg(m_currentDisc.titles.size()));
 
     populateTree(m_currentDisc);
@@ -333,18 +493,98 @@ void MainWindow::onRefreshTree() {
 }
 
 void MainWindow::onTreeItemChanged(QTreeWidgetItem* item, int column) {
-    if (!item || column != 0 ||
-        item->data(0, kItemKindRole).toInt() != TitleItem) {
+    if (!item) return;
+
+    const int kind = item->data(SelectionColumn, kItemKindRole).toInt();
+    const QSignalBlocker blocker(m_tree);
+
+    auto trackCount = [](QTreeWidgetItem* titleItem, const QString& type) {
+        int count = 0;
+        if (!titleItem) return count;
+        for (int i = 0; i < titleItem->childCount(); ++i) {
+            QTreeWidgetItem* child = titleItem->child(i);
+            if (child->data(SelectionColumn, kItemKindRole).toInt() == TrackItem &&
+                child->data(SelectionColumn, kTrackTypeRole).toString() == type) {
+                ++count;
+            }
+        }
+        return count;
+    };
+
+    auto initializeSelectedTrackFlags = [&](QTreeWidgetItem* trackItem) {
+        const QString type =
+            trackItem->data(SelectionColumn, kTrackTypeRole).toString();
+        if (type == "video" && trackCount(trackItem->parent(), type) == 1) {
+            trackItem->setCheckState(DefaultColumn, Qt::Checked);
+        }
+        if (type == "subtitle" &&
+            trackItem->data(SelectionColumn, kForcedFromSourceRole).toBool()) {
+            trackItem->setCheckState(ForcedColumn, Qt::Checked);
+        }
+    };
+
+    if (kind == TitleItem && column == SelectionColumn) {
+        const Qt::CheckState state = item->checkState(SelectionColumn);
+        for (int i = 0; i < item->childCount(); ++i) {
+            QTreeWidgetItem* child = item->child(i);
+            const int childKind =
+                child->data(SelectionColumn, kItemKindRole).toInt();
+            if (childKind != TrackItem && childKind != ChaptersItem) continue;
+
+            child->setCheckState(SelectionColumn, state);
+            if (childKind == TrackItem) {
+                if (state == Qt::Unchecked) {
+                    child->setCheckState(DefaultColumn, Qt::Unchecked);
+                    if (child->data(SelectionColumn, kTrackTypeRole).toString() ==
+                        "subtitle") {
+                        child->setCheckState(ForcedColumn, Qt::Unchecked);
+                    }
+                } else {
+                    initializeSelectedTrackFlags(child);
+                }
+            }
+        }
         return;
     }
 
-    const QSignalBlocker blocker(m_tree);
-    const Qt::CheckState state = item->checkState(0);
-    for (int i = 0; i < item->childCount(); ++i) {
-        QTreeWidgetItem* child = item->child(i);
-        if (child->flags() & Qt::ItemIsUserCheckable) {
-            child->setCheckState(0, state);
+    if (kind != TrackItem) return;
+
+    const QString type = item->data(SelectionColumn, kTrackTypeRole).toString();
+    if (column == SelectionColumn) {
+        if (item->checkState(SelectionColumn) == Qt::Unchecked) {
+            item->setCheckState(DefaultColumn, Qt::Unchecked);
+            if (type == "subtitle") {
+                item->setCheckState(ForcedColumn, Qt::Unchecked);
+            }
+        } else {
+            initializeSelectedTrackFlags(item);
         }
+        return;
+    }
+
+    if (column == DefaultColumn) {
+        if (item->checkState(DefaultColumn) == Qt::Checked) {
+            item->setCheckState(SelectionColumn, Qt::Checked);
+            QTreeWidgetItem* titleItem = item->parent();
+            for (int i = 0; titleItem && i < titleItem->childCount(); ++i) {
+                QTreeWidgetItem* sibling = titleItem->child(i);
+                if (sibling != item &&
+                    sibling->data(SelectionColumn, kItemKindRole).toInt() == TrackItem &&
+                    sibling->data(SelectionColumn, kTrackTypeRole).toString() == type) {
+                    sibling->setCheckState(DefaultColumn, Qt::Unchecked);
+                }
+            }
+        } else if (type == "video" &&
+                   item->checkState(SelectionColumn) == Qt::Checked &&
+                   trackCount(item->parent(), type) == 1) {
+            item->setCheckState(DefaultColumn, Qt::Checked);
+        }
+        return;
+    }
+
+    if (column == ForcedColumn && type == "subtitle" &&
+        item->checkState(ForcedColumn) == Qt::Checked) {
+        item->setCheckState(SelectionColumn, Qt::Checked);
     }
 }
 
@@ -354,32 +594,53 @@ void MainWindow::onSaveMkv() {
     for (int i = 0; i < m_tree->topLevelItemCount() && i < (int)m_currentDisc.titles.size(); i++) {
         QTreeWidgetItem* titleItem = m_tree->topLevelItem(i);
         TitleInfo& title = m_currentDisc.titles[i];
-        title.selected = titleItem->checkState(0) == Qt::Checked;
+        title.output.selected =
+            titleItem->checkState(SelectionColumn) == Qt::Checked;
+        std::set<std::string> defaultTrackTypes;
 
         for (int childIndex = 0; childIndex < titleItem->childCount(); ++childIndex) {
             QTreeWidgetItem* child = titleItem->child(childIndex);
-            int kind = child->data(0, kItemKindRole).toInt();
+            int kind = child->data(SelectionColumn, kItemKindRole).toInt();
             if (kind == TrackItem) {
-                int trackPosition = child->data(0, kItemPositionRole).toInt();
+                int trackPosition =
+                    child->data(SelectionColumn, kItemPositionRole).toInt();
                 if (trackPosition >= 0 &&
                     trackPosition < static_cast<int>(title.tracks.size())) {
-                    title.tracks[trackPosition].selected =
-                        child->checkState(0) == Qt::Checked;
+                    TrackInfo& track = title.tracks[trackPosition];
+                    track.output.selected =
+                        child->checkState(SelectionColumn) == Qt::Checked;
+                    track.output.mkv_default = track.output.selected &&
+                        child->checkState(DefaultColumn) == Qt::Checked;
+                    track.output.mkv_forced = track.output.selected &&
+                        track.type == "subtitle" &&
+                        child->checkState(ForcedColumn) == Qt::Checked;
+
+                    if (track.output.mkv_default &&
+                        !defaultTrackTypes.insert(track.type).second) {
+                        QMessageBox::information(this, "Salvar MKV",
+                            QString("O título %1 possui mais de uma faixa %2 "
+                                    "marcada como Default.")
+                                .arg(title.index)
+                                .arg(QString::fromStdString(track.type)));
+                        return;
+                    }
                 }
             } else if (kind == ChaptersItem) {
-                title.include_chapters = child->checkState(0) == Qt::Checked;
+                title.output.include_chapters =
+                    child->checkState(SelectionColumn) == Qt::Checked;
             }
         }
 
         int selectedTracks = static_cast<int>(std::count_if(
             title.tracks.begin(), title.tracks.end(),
-            [](const TrackInfo& track) { return track.selected; }));
+            [](const TrackInfo& track) { return track.output.selected; }));
         LOG("selection: title=" + std::to_string(title.index) +
-            ", selected=" + (title.selected ? "yes" : "no") +
+            ", selected=" + (title.output.selected ? "yes" : "no") +
             ", selected_tracks=" + std::to_string(selectedTracks) +
-            ", include_chapters=" + (title.include_chapters ? "yes" : "no"));
+            ", include_chapters=" +
+            (title.output.include_chapters ? "yes" : "no"));
 
-        if (title.selected && selectedTracks == 0) {
+        if (title.output.selected && selectedTracks == 0) {
             QMessageBox::information(this, "Salvar MKV",
                 QString("O título %1 não possui nenhuma faixa selecionada.")
                     .arg(title.index));
@@ -389,7 +650,7 @@ void MainWindow::onSaveMkv() {
 
     int selCount = 0;
     for (const auto& t : m_currentDisc.titles)
-        if (t.selected) selCount++;
+        if (t.output.selected) selCount++;
 
     if (selCount == 0) {
         QMessageBox::information(this, "Salvar MKV", "Nenhum título selecionado.");

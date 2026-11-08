@@ -11,15 +11,23 @@ media and remuxing selected titles to Matroska without re-encoding.
 
 ## Project status
 
-This project is an early preview. DVD-Video ISO remuxing is the most exercised
-path; Blu-ray support remains experimental and needs a broader regression set.
+The stable 0.2 line focuses on DVD-Video remuxing from ISO images, copied disc
+folders, and optical drives. Blu-ray support remains experimental and needs a
+broader real-media regression set.
+
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the prioritized implementation and
+verification backlog.
+See [`CHANGELOG.md`](CHANGELOG.md) for release history.
 
 Implemented:
 
 - Qt 5 desktop interface for opening folders, optical drives, and ISO images;
+- typed source, disc, title, and output-selection models;
 - DVD title playback through `libdvdnav`, preserving logical cells and angle;
 - DVD and Blu-ray title/track discovery through `libdvdread` and `libbluray`;
 - selectable video, audio, VobSub/PGS subtitle tracks, and chapters;
+- explicit Matroska `DefaultTrack` and `ForcedTrack` selection;
+- Windows optical-drive discovery with media readiness reporting;
 - ISO 639 language metadata and Matroska chapter output;
 - stream-copy remuxing through FFmpeg libraries, without transcoding;
 - adaptive, global DVD SCR correction across active video/audio streams;

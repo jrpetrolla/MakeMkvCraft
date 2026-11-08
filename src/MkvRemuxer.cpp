@@ -235,7 +235,7 @@ static bool setVobSubCodecPrivate(AVCodecParameters* parameters,
 
 static bool addChaptersToOutput(AVFormatContext* output, const TitleInfo& title,
                                 std::string& errorMsg) {
-    if (!title.include_chapters) {
+    if (!title.output.include_chapters) {
         LOG("remuxWithLibav: chapters omitted by user selection");
         return true;
     }
@@ -278,7 +278,7 @@ static bool prepareDvdSubtitleStreams(AVFormatContext* input, const TitleInfo& t
     std::set<int> expectedSubtitleIds;
     for (const TrackInfo& track : title.tracks) {
         if (track.type == "subtitle" && track.codec == "DVD-VOBSub" &&
-            track.selected && track.stream_id >= 0) {
+            track.output.selected && track.stream_id >= 0) {
             expectedSubtitleIds.insert(track.stream_id);
         }
     }
@@ -355,15 +355,20 @@ static bool parseMpeg2PackScr90k(const uint8_t* data, int32_t length, int64_t& s
     return true;
 }
 
-// --- DVD ISO remux: follow the logical DVD title, then remux ---
+// --- DVD remux: follow the logical title for ISO, folder, or optical drive ---
 
-bool MkvRemuxer::remuxDvdIso(const DiscInfo& disc, const TitleInfo& title,
-                              const std::string& outputPath, std::string& errorMsg) {
-    LOG("remuxDvdIso: start, source=" + disc.source_path + ", title=" + std::to_string(title.index));
+bool MkvRemuxer::remuxDvdTitle(const DiscInfo& disc, const TitleInfo& title,
+                                const std::string& outputPath, std::string& errorMsg) {
+    LOG("remuxDvdIso: start, source=" + disc.source_path +
+        ", title=" + std::to_string(title.index) +
+        ", vts=" + std::to_string(title.dvd.vts) +
+        ", ttn=" + std::to_string(title.dvd.ttn) +
+        ", pgc=" + std::to_string(title.dvd.pgc) +
+        ", inspected_angles=" + std::to_string(title.dvd.angle_count));
 
     dvdnav_t* dvdnav = nullptr;
     if (dvdnav_open(&dvdnav, disc.source_path.c_str()) != DVDNAV_STATUS_OK || !dvdnav) {
-        errorMsg = "Não foi possível abrir a ISO com libdvdnav.";
+        errorMsg = "Não foi possível abrir a origem DVD com libdvdnav.";
         LOG("remuxDvdIso: dvdnav_open failed");
         return false;
     }
@@ -402,17 +407,32 @@ bool MkvRemuxer::remuxDvdIso(const DiscInfo& disc, const TitleInfo& title,
 
     int32_t currentAngle = 1;
     int32_t angleCount = 1;
+    int32_t selectedAngle = 1;
     if (dvdnav_get_angle_info(dvdnav, &currentAngle, &angleCount) == DVDNAV_STATUS_OK &&
         angleCount > 0) {
-        if (dvdnav_angle_change(dvdnav, 1) != DVDNAV_STATUS_OK) {
-            errorMsg = "Não foi possível selecionar o primeiro ângulo do título DVD.";
+        if (title.dvd.angle < 1 || title.dvd.angle > angleCount) {
+            errorMsg = "Ângulo selecionado não existe neste título DVD.";
+            LOG("remuxDvdIso: invalid selected angle=" +
+                std::to_string(title.dvd.angle) + ", available=" +
+                std::to_string(angleCount));
+            closeDvdnav();
+            return false;
+        }
+        selectedAngle = title.dvd.angle;
+        if (dvdnav_angle_change(dvdnav, selectedAngle) != DVDNAV_STATUS_OK) {
+            errorMsg = "Não foi possível selecionar o ângulo do título DVD.";
             LOG("remuxDvdIso: dvdnav_angle_change failed");
             closeDvdnav();
             return false;
         }
+        if (angleCount != title.dvd.angle_count) {
+            LOG("remuxDvdIso: angle count changed after inspection, inspected=" +
+                std::to_string(title.dvd.angle_count) + ", playback=" +
+                std::to_string(angleCount));
+        }
     }
     LOG("remuxDvdIso: title playback started, angles=" + std::to_string(angleCount) +
-        ", selected=1");
+        ", selected=" + std::to_string(selectedAngle));
 
     // Create temp VOB file next to output
     fs::path outPath(outputPath);
@@ -1094,7 +1114,7 @@ bool MkvRemuxer::remuxWithLibav(const std::string& inputPath, const std::string&
                 " is not declared for this title's " + mediaType + " tracks");
             continue;
         }
-        if (trackInfo && !trackInfo->selected) {
+        if (trackInfo && !trackInfo->output.selected) {
             LOG("remuxWithLibav: skipping stream " + std::to_string(i) +
                 " because it was unchecked by the user, id=" +
                 std::format("0x{:x}", inStream->id));
@@ -1130,8 +1150,18 @@ bool MkvRemuxer::remuxWithLibav(const std::string& inputPath, const std::string&
         outStream->time_base = inStream->time_base;
         outStream->id = inStream->id;
         av_dict_copy(&outStream->metadata, inStream->metadata, 0);
+        outStream->disposition = inStream->disposition;
 
         if (trackInfo) {
+            outStream->disposition &=
+                ~(AV_DISPOSITION_DEFAULT | AV_DISPOSITION_FORCED);
+            if (trackInfo->output.mkv_default) {
+                outStream->disposition |= AV_DISPOSITION_DEFAULT;
+            }
+            if (trackInfo->type == "subtitle" && trackInfo->output.mkv_forced) {
+                outStream->disposition |= AV_DISPOSITION_FORCED;
+            }
+
             const std::string language = trackInfo->language.empty()
                 ? "und" : trackInfo->language;
             av_dict_set(&outStream->metadata, "language", language.c_str(), 0);
@@ -1142,9 +1172,8 @@ bool MkvRemuxer::remuxWithLibav(const std::string& inputPath, const std::string&
                     trackTitle = "Commentary";
                 }
             } else if (trackInfo->type == "subtitle") {
-                if (trackInfo->code_extension == 9) {
+                if (trackInfo->output.mkv_forced) {
                     trackTitle = "Forced";
-                    outStream->disposition |= AV_DISPOSITION_FORCED;
                 } else if (trackInfo->code_extension >= 13 &&
                            trackInfo->code_extension <= 15) {
                     trackTitle = "Commentary";
@@ -1167,7 +1196,11 @@ bool MkvRemuxer::remuxWithLibav(const std::string& inputPath, const std::string&
                 ", id=" + std::format("0x{:x}", inStream->id) +
                 ", type=" + trackInfo->type +
                 ", language=" +
-                (trackInfo->language.empty() ? "und" : trackInfo->language));
+                (trackInfo->language.empty() ? "und" : trackInfo->language) +
+                ", default=" +
+                (trackInfo->output.mkv_default ? "yes" : "no") +
+                ", forced=" +
+                (trackInfo->output.mkv_forced ? "yes" : "no"));
         }
         inputToOutput[i] = mappedStreamCount;
         if (referenceVideoInputStream < 0 &&
@@ -2352,32 +2385,22 @@ bool MkvRemuxer::remuxWithLibav(const std::string& inputPath, const std::string&
 
 bool MkvRemuxer::remuxTitle(const DiscInfo& disc, const TitleInfo& title,
                             const std::string& outputPath, std::string& errorMsg) {
-    LOG("remuxTitle: disc_type=" + disc.disc_type + ", title=" + std::to_string(title.index) +
+    LOG("remuxTitle: disc_type=" + discTypeLabel(disc.disc_kind, disc.source_kind) +
+        ", source_kind=" + sourceKindName(disc.source_kind) +
+        ", title=" + std::to_string(title.index) +
         ", output=" + outputPath);
 
-    if (disc.disc_type == "DVD-Video (ISO)") {
-        return remuxDvdIso(disc, title, outputPath, errorMsg);
+    if (disc.disc_kind == DiscKind::DvdVideo) {
+        return remuxDvdTitle(disc, title, outputPath, errorMsg);
     }
 
-    if (disc.disc_type == "Blu-ray (ISO)") {
+    if (disc.disc_kind == DiscKind::BluRay &&
+        disc.source_kind == SourceKind::IsoImage) {
         LOG("remuxTitle: using remuxWithLibav for Blu-ray ISO");
         return remuxWithLibav(disc.source_path, outputPath, title, errorMsg);
     }
 
-    if (disc.disc_type == "DVD-Video") {
-        fs::path videoTs = fs::path(disc.source_path) / "VIDEO_TS";
-        if (!fs::exists(videoTs)) {
-            videoTs = disc.source_path;
-        }
-        std::string vtsFile = std::format("{}/VTS_{:02d}_1.VOB", videoTs.string(), title.index);
-        if (!fs::exists(vtsFile)) {
-            errorMsg = "Arquivo VOB não encontrado: " + vtsFile;
-            LOG("remuxTitle: VOB not found: " + vtsFile);
-            return false;
-        }
-        return remuxWithLibav(vtsFile, outputPath, title, errorMsg);
-    }
-    else if (disc.disc_type == "Blu-ray") {
+    if (disc.disc_kind == DiscKind::BluRay) {
         fs::path streamDir = fs::path(disc.source_path) / "STREAM";
         if (!fs::exists(streamDir)) {
             streamDir = fs::path(disc.source_path) / "BDMV" / "STREAM";
@@ -2403,7 +2426,7 @@ int MkvRemuxer::remuxSelected(const DiscInfo& disc, const std::string& outputFol
     m_totalWork = 0;
     m_selectedTitleCount = 0;
     for (const auto& title : disc.titles) {
-        if (!title.selected) continue;
+        if (!title.output.selected) continue;
         m_totalWork += std::max<int64_t>(title.duration_ms, 1);
         m_selectedTitleCount++;
     }
@@ -2416,7 +2439,7 @@ int MkvRemuxer::remuxSelected(const DiscInfo& disc, const std::string& outputFol
 
     int successCount = 0;
     for (const auto& title : disc.titles) {
-        if (!title.selected) continue;
+        if (!title.output.selected) continue;
 
         m_currentTitleOrdinal++;
         m_currentTitleWork = std::max<int64_t>(title.duration_ms, 1);

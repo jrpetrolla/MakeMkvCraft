@@ -27,21 +27,27 @@ extern "C" {
 
 namespace fs = std::filesystem;
 
-static pgc_t* findTitlePgc(ifo_handle_t* vts, int vtsTitleNumber) {
+static int findTitlePgcNumber(ifo_handle_t* vts, int vtsTitleNumber) {
     if (!vts || !vts->vts_ptt_srpt || !vts->vts_pgcit || vtsTitleNumber < 1 ||
         vtsTitleNumber > vts->vts_ptt_srpt->nr_of_srpts) {
-        return nullptr;
+        return 0;
     }
 
     const ttu_t& titleUnit = vts->vts_ptt_srpt->title[vtsTitleNumber - 1];
     if (titleUnit.nr_of_ptts < 1 || !titleUnit.ptt) {
-        return nullptr;
+        return 0;
     }
 
     int pgcNumber = titleUnit.ptt[0].pgcn;
     if (pgcNumber < 1 || pgcNumber > vts->vts_pgcit->nr_of_pgci_srp) {
-        return nullptr;
+        return 0;
     }
+    return pgcNumber;
+}
+
+static pgc_t* findTitlePgc(ifo_handle_t* vts, int vtsTitleNumber) {
+    int pgcNumber = findTitlePgcNumber(vts, vtsTitleNumber);
+    if (pgcNumber == 0) return nullptr;
     return vts->vts_pgcit->pgci_srp[pgcNumber - 1].pgc;
 }
 
@@ -173,8 +179,12 @@ static void populateDvdTitle(ifo_handle_t* vts, int vtsTitleNumber, TitleInfo& t
     pgc_t* pgc = findTitlePgc(vts, vtsTitleNumber);
     if (!pgc || !vts->vtsi_mat) return;
 
+    title.dvd.pgc = findTitlePgcNumber(vts, vtsTitleNumber);
     title.duration_ms = dvdTimeToMilliseconds(pgc->playback_time);
     addDvdChapters(vts, vtsTitleNumber, title);
+    if (!title.chapters.empty()) {
+        title.duration_ms = title.chapters.back().end_ms;
+    }
 
     const auto [videoWidth, videoHeight] = dvdVideoSize(vts->vtsi_mat->vts_video_attr);
     TrackInfo video;
@@ -184,7 +194,6 @@ static void populateDvdTitle(ifo_handle_t* vts, int vtsTitleNumber, TitleInfo& t
     video.width = videoWidth;
     video.height = videoHeight;
     video.stream_id = 0x1e0;
-    video.selected = true;
     title.tracks.push_back(video);
 
     int audioCount = std::min<int>(8, vts->vtsi_mat->nr_of_vts_audio_streams);
@@ -200,7 +209,6 @@ static void populateDvdTitle(ifo_handle_t* vts, int vtsTitleNumber, TitleInfo& t
         track.language = dvdLanguageToIso6392(attr.lang_code);
         track.channels = attr.channels + 1;
         track.code_extension = attr.code_extension;
-        track.selected = true;
 
         switch (attr.audio_format) {
         case 0:
@@ -248,11 +256,11 @@ static void populateDvdTitle(ifo_handle_t* vts, int vtsTitleNumber, TitleInfo& t
         track.height = videoHeight;
         track.stream_id = streamId;
         track.code_extension = attr.code_extension;
+        track.forced_from_source = attr.code_extension == 9;
         for (size_t paletteIndex = 0; paletteIndex < track.palette.size(); ++paletteIndex) {
             track.palette[paletteIndex] = pgc->palette[paletteIndex];
         }
         track.has_palette = true;
-        track.selected = true;
         title.tracks.push_back(track);
     }
 }
@@ -289,6 +297,41 @@ static std::string toLower(const std::string& s) {
     return r;
 }
 
+static std::string blurayClipId(const BLURAY_CLIP_INFO& clip) {
+    size_t length = 0;
+    while (length < sizeof(clip.clip_id) && clip.clip_id[length] != '\0') {
+        ++length;
+    }
+    return std::string(clip.clip_id, length);
+}
+
+static void initializeOutputSelection(DiscInfo& info) {
+    if (info.titles.empty()) return;
+
+    auto longest = std::max_element(
+        info.titles.begin(), info.titles.end(),
+        [](const TitleInfo& left, const TitleInfo& right) {
+            return left.duration_ms < right.duration_ms;
+        });
+
+    for (auto& title : info.titles) {
+        const bool selected = &title == &*longest;
+        title.output.selected = selected;
+        title.output.include_chapters = selected && !title.chapters.empty();
+
+        const auto videoCount = std::count_if(
+            title.tracks.begin(), title.tracks.end(),
+            [](const TrackInfo& track) { return track.type == "video"; });
+        for (auto& track : title.tracks) {
+            track.output.selected = selected;
+            track.output.mkv_default =
+                selected && track.type == "video" && videoCount == 1;
+            track.output.mkv_forced =
+                selected && track.type == "subtitle" && track.forced_from_source;
+        }
+    }
+}
+
 // Using fs::is_directory / fs::is_regular_file defined above
 
 std::string DiscInspector::detectVolumeLabel(const std::string& path) {
@@ -300,11 +343,21 @@ std::string DiscInspector::detectVolumeLabel(const std::string& path) {
 DiscInfo DiscInspector::inspectDirectory(const std::string& path) {
     DiscInfo info;
     info.source_path = path;
+    info.source_kind = SourceKind::Folder;
     info.valid = false;
 
     if (!dirExists(path)) {
         info.error = "Pasta não existe.";
         return info;
+    }
+
+    const std::string selectedDirectory =
+        toLower(fs::path(path).filename().string());
+    if (selectedDirectory == "video_ts") {
+        return inspectDvd(path);
+    }
+    if (selectedDirectory == "bdmv") {
+        return inspectBluRay(path);
     }
 
     // Look for VIDEO_TS (case-insensitive)
@@ -325,9 +378,24 @@ DiscInfo DiscInspector::inspectDirectory(const std::string& path) {
     return info;
 }
 
+DiscInfo DiscInspector::inspectOpticalDrive(const std::string& path) {
+    DiscInfo info;
+    try {
+        info = inspectDirectory(path);
+    } catch (const fs::filesystem_error&) {
+        info.source_path = path;
+        info.error =
+            "A unidade óptica ficou indisponível durante a leitura.";
+        info.valid = false;
+    }
+    info.source_kind = SourceKind::OpticalDrive;
+    return info;
+}
+
 DiscInfo DiscInspector::inspectImage(const std::string& isoPath) {
     DiscInfo info;
     info.source_path = isoPath;
+    info.source_kind = SourceKind::IsoImage;
     info.valid = false;
 
     if (!fileExists(isoPath)) {
@@ -361,7 +429,6 @@ DiscInfo DiscInspector::inspectImage(const std::string& isoPath) {
         bd_close(bd);
     }
 
-    info.disc_type = "ISO Image";
     info.error = "A imagem ISO não contém estrutura DVD-Video ou Blu-ray reconhecida.";
     return info;
 }
@@ -369,7 +436,8 @@ DiscInfo DiscInspector::inspectImage(const std::string& isoPath) {
 DiscInfo DiscInspector::inspectDvdIso(const std::string& isoPath) {
     DiscInfo info;
     info.source_path = isoPath;
-    info.disc_type = "DVD-Video (ISO)";
+    info.source_kind = SourceKind::IsoImage;
+    info.disc_kind = DiscKind::DvdVideo;
     info.valid = false;
 
     dvd_reader_t* dvd = DVDOpen(isoPath.c_str());
@@ -394,7 +462,11 @@ DiscInfo DiscInspector::inspectDvdIso(const std::string& isoPath) {
         title.name = "Título " + std::to_string(t + 1);
         title.duration_ms = 0;
         title.chapter_count = vmg->tt_srpt->title[t].nr_of_ptts;
-        title.selected = (t == 0);
+        title.dvd.vts = vmg->tt_srpt->title[t].title_set_nr;
+        title.dvd.ttn = vmg->tt_srpt->title[t].vts_ttn;
+        title.dvd.angle = 1;
+        title.dvd.angle_count =
+            std::max<int>(1, vmg->tt_srpt->title[t].nr_of_angles);
 
         ifo_handle_t* vts = ifoOpen(dvd, vmg->tt_srpt->title[t].title_set_nr);
         if (vts) {
@@ -406,6 +478,7 @@ DiscInfo DiscInspector::inspectDvdIso(const std::string& isoPath) {
 
     ifoClose(vmg);
     DVDClose(dvd);
+    initializeOutputSelection(info);
     info.valid = true;
     return info;
 }
@@ -413,7 +486,8 @@ DiscInfo DiscInspector::inspectDvdIso(const std::string& isoPath) {
 DiscInfo DiscInspector::inspectBluRayIso(const std::string& isoPath) {
     DiscInfo info;
     info.source_path = isoPath;
-    info.disc_type = "Blu-ray (ISO)";
+    info.source_kind = SourceKind::IsoImage;
+    info.disc_kind = DiscKind::BluRay;
     info.valid = false;
 
     BLURAY* bd = bd_open(isoPath.c_str(), nullptr);
@@ -439,11 +513,12 @@ DiscInfo DiscInspector::inspectBluRayIso(const std::string& isoPath) {
         title.name = "Playlist " + std::to_string(ti->playlist);
         title.duration_ms = static_cast<int64_t>(ti->duration / 90);
         title.chapter_count = ti->chapter_count;
-        title.selected = (p == 0);
+        title.bluray.playlist = ti->playlist;
         addBlurayChapters(ti, title);
 
         for (uint32_t c = 0; c < ti->clip_count; c++) {
             BLURAY_CLIP_INFO* clip = &ti->clips[c];
+            title.bluray.clip_ids.push_back(blurayClipId(*clip));
 
             for (uint32_t v = 0; v < clip->video_stream_count; v++) {
                 TrackInfo track;
@@ -453,7 +528,6 @@ DiscInfo DiscInspector::inspectBluRayIso(const std::string& isoPath) {
                 track.width = clip->video_streams[v].format;
                 track.height = 0;
                 track.stream_id = clip->video_streams[v].pid;
-                track.selected = true;
                 title.tracks.push_back(track);
             }
 
@@ -465,7 +539,6 @@ DiscInfo DiscInspector::inspectBluRayIso(const std::string& isoPath) {
                 track.channels = clip->audio_streams[a].format;
                 track.language = blurayLanguage(clip->audio_streams[a].lang);
                 track.stream_id = clip->audio_streams[a].pid;
-                track.selected = true;
                 title.tracks.push_back(track);
             }
 
@@ -476,7 +549,6 @@ DiscInfo DiscInspector::inspectBluRayIso(const std::string& isoPath) {
                 track.codec = "PGS";
                 track.language = blurayLanguage(clip->pg_streams[s].lang);
                 track.stream_id = clip->pg_streams[s].pid;
-                track.selected = true;
                 title.tracks.push_back(track);
             }
         }
@@ -486,26 +558,30 @@ DiscInfo DiscInspector::inspectBluRayIso(const std::string& isoPath) {
     }
 
     bd_close(bd);
+    initializeOutputSelection(info);
     info.valid = true;
     return info;
 }
 
 DiscInfo DiscInspector::inspectDvd(const std::string& videoTsPath) {
     DiscInfo info;
-    info.source_path = videoTsPath;
-    info.disc_type = "DVD-Video";
+    fs::path dvdRoot = videoTsPath;
+    if (toLower(dvdRoot.filename().string()) == "video_ts") {
+        dvdRoot = dvdRoot.parent_path();
+    }
+    info.source_path = dvdRoot.string();
+    info.source_kind = SourceKind::Folder;
+    info.disc_kind = DiscKind::DvdVideo;
     info.valid = false;
 
-    dvd_reader_t* dvd = DVDOpen(videoTsPath.c_str());
+    dvd_reader_t* dvd = DVDOpen(info.source_path.c_str());
     if (!dvd) {
-        // Try parent directory
-        fs::path parent = fs::path(videoTsPath).parent_path();
-        dvd = DVDOpen(parent.string().c_str());
+        dvd = DVDOpen(videoTsPath.c_str());
         if (!dvd) {
             info.error = "Não foi possível abrir a estrutura DVD-Video com libdvdread.";
             return info;
         }
-        info.source_path = parent.string();
+        info.source_path = videoTsPath;
     }
 
     ifo_handle_t* vmg = ifoOpen(dvd, 0);
@@ -524,7 +600,11 @@ DiscInfo DiscInspector::inspectDvd(const std::string& videoTsPath) {
         title.name = "Título " + std::to_string(t + 1);
         title.duration_ms = 0;
         title.chapter_count = vmg->tt_srpt->title[t].nr_of_ptts;
-        title.selected = (t == 0); // Select first title by default
+        title.dvd.vts = vmg->tt_srpt->title[t].title_set_nr;
+        title.dvd.ttn = vmg->tt_srpt->title[t].vts_ttn;
+        title.dvd.angle = 1;
+        title.dvd.angle_count =
+            std::max<int>(1, vmg->tt_srpt->title[t].nr_of_angles);
 
         ifo_handle_t* vts = ifoOpen(dvd, vmg->tt_srpt->title[t].title_set_nr);
         if (vts) {
@@ -536,6 +616,7 @@ DiscInfo DiscInspector::inspectDvd(const std::string& videoTsPath) {
 
     ifoClose(vmg);
     DVDClose(dvd);
+    initializeOutputSelection(info);
     info.valid = true;
     return info;
 }
@@ -543,7 +624,8 @@ DiscInfo DiscInspector::inspectDvd(const std::string& videoTsPath) {
 DiscInfo DiscInspector::inspectBluRay(const std::string& bdmvPath) {
     DiscInfo info;
     info.source_path = bdmvPath;
-    info.disc_type = "Blu-ray";
+    info.source_kind = SourceKind::Folder;
+    info.disc_kind = DiscKind::BluRay;
     info.valid = false;
 
     // libbluray expects the root containing BDMV/
@@ -574,12 +656,13 @@ DiscInfo DiscInspector::inspectBluRay(const std::string& bdmvPath) {
         title.name = "Playlist " + std::to_string(ti->playlist);
         title.duration_ms = static_cast<int64_t>(ti->duration / 90);
         title.chapter_count = ti->chapter_count;
-        title.selected = (p == 0);
+        title.bluray.playlist = ti->playlist;
         addBlurayChapters(ti, title);
 
         // Video, audio, subtitle clips
         for (uint32_t c = 0; c < ti->clip_count; c++) {
             BLURAY_CLIP_INFO* clip = &ti->clips[c];
+            title.bluray.clip_ids.push_back(blurayClipId(*clip));
 
             // Video streams
             for (uint32_t v = 0; v < clip->video_stream_count; v++) {
@@ -590,7 +673,6 @@ DiscInfo DiscInspector::inspectBluRay(const std::string& bdmvPath) {
                 track.width = clip->video_streams[v].format;
                 track.height = 0;
                 track.stream_id = clip->video_streams[v].pid;
-                track.selected = true;
                 title.tracks.push_back(track);
             }
 
@@ -603,7 +685,6 @@ DiscInfo DiscInspector::inspectBluRay(const std::string& bdmvPath) {
                 track.channels = clip->audio_streams[a].format;
                 track.language = blurayLanguage(clip->audio_streams[a].lang);
                 track.stream_id = clip->audio_streams[a].pid;
-                track.selected = true;
                 title.tracks.push_back(track);
             }
 
@@ -615,7 +696,6 @@ DiscInfo DiscInspector::inspectBluRay(const std::string& bdmvPath) {
                 track.codec = "PGS";
                 track.language = blurayLanguage(clip->pg_streams[s].lang);
                 track.stream_id = clip->pg_streams[s].pid;
-                track.selected = true;
                 title.tracks.push_back(track);
             }
         }
@@ -625,6 +705,7 @@ DiscInfo DiscInspector::inspectBluRay(const std::string& bdmvPath) {
     }
 
     bd_close(bd);
+    initializeOutputSelection(info);
     info.valid = true;
     return info;
 }

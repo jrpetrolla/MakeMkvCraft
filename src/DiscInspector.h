@@ -6,6 +6,43 @@
 #include <vector>
 #include <memory>
 
+enum class SourceKind {
+    Unknown,
+    Folder,
+    IsoImage,
+    OpticalDrive
+};
+
+enum class DiscKind {
+    Unknown,
+    DvdVideo,
+    BluRay
+};
+
+struct TrackOutputOptions {
+    bool selected = false;
+    bool mkv_default = false;
+    bool mkv_forced = false;
+};
+
+struct TitleOutputOptions {
+    bool selected = false;
+    bool include_chapters = true;
+};
+
+struct DvdTitleIdentity {
+    int vts = 0;
+    int ttn = 0;
+    int pgc = 0;
+    int angle = 1;
+    int angle_count = 1;
+};
+
+struct BlurayTitleIdentity {
+    uint32_t playlist = 0;
+    std::vector<std::string> clip_ids;
+};
+
 struct ChapterInfo {
     int index = 0;
     std::string name;
@@ -26,7 +63,8 @@ struct TrackInfo {
     int code_extension = 0;  // DVD language/usage extension
     std::array<uint32_t, 16> palette{}; // DVD YCrCb subtitle palette
     bool has_palette = false;
-    bool selected = false;
+    bool forced_from_source = false;
+    TrackOutputOptions output;
 };
 
 struct TitleInfo {
@@ -36,23 +74,47 @@ struct TitleInfo {
     int chapter_count = 0;
     std::vector<ChapterInfo> chapters;
     std::vector<TrackInfo> tracks;
-    bool include_chapters = true;
-    bool selected = false;
+    DvdTitleIdentity dvd;
+    BlurayTitleIdentity bluray;
+    TitleOutputOptions output;
 };
 
 struct DiscInfo {
     std::string source_path;
-    std::string disc_type;   // "DVD-Video", "Blu-ray", "ISO Image"
+    SourceKind source_kind = SourceKind::Unknown;
+    DiscKind disc_kind = DiscKind::Unknown;
     std::string volume_label;
     std::vector<TitleInfo> titles;
     bool valid = false;
     std::string error;
 };
 
+inline const char* sourceKindName(SourceKind kind) {
+    switch (kind) {
+    case SourceKind::Folder: return "folder";
+    case SourceKind::IsoImage: return "iso";
+    case SourceKind::OpticalDrive: return "optical-drive";
+    default: return "unknown";
+    }
+}
+
+inline std::string discTypeLabel(DiscKind discKind, SourceKind sourceKind) {
+    std::string label;
+    switch (discKind) {
+    case DiscKind::DvdVideo: label = "DVD-Video"; break;
+    case DiscKind::BluRay: label = "Blu-ray"; break;
+    default: label = "Desconhecido"; break;
+    }
+    if (sourceKind == SourceKind::IsoImage) label += " (ISO)";
+    if (sourceKind == SourceKind::OpticalDrive) label += " (unidade)";
+    return label;
+}
+
 class DiscInspector {
 public:
     DiscInfo inspectDirectory(const std::string& path);
     DiscInfo inspectImage(const std::string& isoPath);
+    DiscInfo inspectOpticalDrive(const std::string& path);
 
 private:
     DiscInfo inspectDvd(const std::string& videoTsPath);

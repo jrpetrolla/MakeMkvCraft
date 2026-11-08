@@ -64,8 +64,8 @@ private:
                         const TitleInfo& title, std::string& errorMsg,
                         const std::vector<DvdClockSegment>& dvdClockTimeline = {},
                         int titleProgressStart = 0, int titleProgressEnd = 1000);
-    bool remuxDvdIso(const DiscInfo& disc, const TitleInfo& title,
-                     const std::string& outputPath, std::string& errorMsg);
+    bool remuxDvdTitle(const DiscInfo& disc, const TitleInfo& title,
+                       const std::string& outputPath, std::string& errorMsg);
 
     ProgressCallback m_progressCallback;
     int64_t m_completedWork = 0;
